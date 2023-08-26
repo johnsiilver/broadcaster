@@ -114,6 +114,8 @@ import (
 // Path splits a string into a path. It is a convenience function for
 // creating paths used in this package from strings. It splits on /.
 func Path(s string) []string {
+	s = strings.TrimPrefix(s, "/")
+	s = strings.TrimSuffix(s, "/")
 	return strings.Split(s, "/")
 }
 
