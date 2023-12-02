@@ -12,6 +12,10 @@ import (
 	"github.com/kylelemons/godebug/pretty"
 )
 
+func init() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+}
+
 func TestReceiver_Next(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -320,9 +324,9 @@ func TestSender_Send(t *testing.T) {
 	p1s := "path/1"
 	p2s := "path/2"
 	p1sSub := "path/1/subpath"
-	p1 := Path(p1s)
-	p2 := Path(p2s)
-	p1Sub := Path(p1sSub)
+	p1 := MkPath(p1s)
+	p2 := MkPath(p2s)
+	p1Sub := MkPath(p1sSub)
 
 	tests := []struct {
 		name           string
@@ -352,7 +356,7 @@ func TestSender_Send(t *testing.T) {
 				recvs = append(recvs, s.mustReceiver(p1Sub, 1))
 				return recvs
 			},
-			messagePath:   Path("path/*"),
+			messagePath:   MkPath("path/*"),
 			messageToSend: Message[int]{data: 20},
 			expectedData:  map[string]int{p1s: 20, p2s: 20},
 		},
@@ -365,7 +369,7 @@ func TestSender_Send(t *testing.T) {
 				recvs = append(recvs, s.mustReceiver(p1Sub, 1))
 				return recvs
 			},
-			messagePath:   Path("path/1/**"),
+			messagePath:   MkPath("path/1/**"),
 			messageToSend: Message[int]{data: 30},
 			expectedData:  map[string]int{p1s: 30, p1sSub: 30},
 		},
@@ -480,7 +484,7 @@ func TestRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			p := Path(fmt.Sprintf("path/%d", i))
+			p := MkPath(fmt.Sprintf("path/%d", i))
 			r, err := s.Receiver(p, 1)
 			if err != nil {
 				panic(err)
@@ -504,6 +508,216 @@ func TestRace(t *testing.T) {
 			r.Close()
 		}()
 	}
+	wg.Wait()
+}
+
+func TestExample1(t *testing.T) {
+	s := New[bool]()
+	r1, err := s.Receiver(MkPath("foo/yep"), 1)
+	if err != nil {
+		panic(err)
+	}
+	r2, err := s.Receiver(MkPath("foo/baz/yep"), 1)
+	if err != nil {
+		panic(err)
+	}
+	wg := sync.WaitGroup{}
+
+	got := [2]bool{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		m := r1.Next(context.Background())
+		fmt.Println("r1 received: ", m.Data())
+		r1.Close()
+		got[0] = m.Data()
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		m := r2.Next(context.Background())
+		fmt.Println("r2 received: ", m.Data())
+		r2.Close()
+		got[1] = m.Data()
+	}()
+
+	// This will send to all receivers, as ** matches all paths recursively.
+	// ** is only valid as the last element of a path.
+	msg, err := NewMessage(MkPath("**"), true)
+	if err != nil {
+		panic(err)
+	}
+	s.Send(msg)
+
+	wg.Wait()
+
+	for i := 0; i < len(got); i++ {
+		if !got[i] {
+			log.Println("did not receive all expected messages")
+		}
+	}
+}
+
+func TestExample2(t *testing.T) {
+	s := New[int]()
+	r1, err := s.Receiver(MkPath("foo/yep"), 1)
+	if err != nil {
+		panic(err)
+	}
+	r2, err := s.Receiver(MkPath("foo/baz/yep"), 1)
+	if err != nil {
+		panic(err)
+	}
+	wg := sync.WaitGroup{}
+
+	got := [2]int{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		m := r1.Next(context.Background())
+		fmt.Println("r1 received: ", m.Data())
+		r1.Close()
+		got[0] = m.Data()
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		m := r2.Next(context.Background())
+		fmt.Println("r2 received: ", m.Data())
+		r2.Close()
+		got[1] = m.Data()
+	}()
+
+	msg, err := NewMessage(MkPath("foo/yep"), 1)
+	if err != nil {
+		panic(err)
+	}
+	s.Send(msg)
+
+	msg, err = NewMessage(MkPath("foo/baz/yep"), 2)
+	if err != nil {
+		panic(err)
+	}
+	s.Send(msg)
+
+	wg.Wait()
+
+	for i := 0; i < len(got); i++ {
+		if got[i] != i+1 {
+			log.Println("did not receive all expected messages")
+		}
+	}
+}
+
+func TestExample3(t *testing.T) {
+	s := New[bool]()
+	r1, err := s.Receiver(MkPath("foo/bar"), 1)
+	if err != nil {
+		panic(err)
+	}
+	r2, err := s.Receiver(MkPath("foo/bar/yep"), 1)
+	if err != nil {
+		panic(err)
+	}
+	r3, err := s.Receiver(MkPath("foo/bar/qux/nope"), 1)
+	if err != nil {
+		panic(err)
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		for {
+			m := r1.Next(context.Background())
+			fmt.Println("r1 received: ", m.Data())
+			wg.Done()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		for {
+			m := r2.Next(context.Background())
+			fmt.Println("r2 received: ", m.Data())
+			wg.Done()
+		}
+	}()
+
+	// We don't do a wg.Add() here because this should not get a message.
+	go func() {
+		for {
+			m := r3.Next(context.Background())
+			fmt.Println("r3 received: ", m.Data())
+		}
+	}()
+
+	// This will send to receivers "foo/bar" and "foo/bar/yep".
+	// It will not send to "foo/bar/qux/nope" because it is not a direct child of "foo/bar".
+	// * is only valid as the last element of a path.
+	msg, err := NewMessage(MkPath("foo/bar/*"), true)
+	if err != nil {
+		panic(err)
+	}
+	log.Println("here")
+	if err := s.Send(msg); err != nil {
+		panic(err)
+	}
+	log.Println("and here")
+	wg.Wait()
+}
+
+func TestExample4(t *testing.T) {
+	s := New[bool]()
+	r1, err := s.Receiver(MkPath("foo/bar"), 1)
+	if err != nil {
+		panic(err)
+	}
+	r2, err := s.Receiver(MkPath("foo/bar/yep"), 1)
+	if err != nil {
+		panic(err)
+	}
+	r3, err := s.Receiver(MkPath("foo/bar/qux/nope"), 1)
+	if err != nil {
+		panic(err)
+	}
+
+	go func() {
+		for {
+			m := r1.Next(context.Background())
+			fmt.Println("r1 received: ", m.Data())
+		}
+	}()
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		for {
+			m := r2.Next(context.Background())
+			fmt.Println("r2 received: ", m.Data())
+			wg.Done()
+		}
+	}()
+
+	go func() {
+		for {
+			m := r3.Next(context.Background())
+			fmt.Println("r3 received: ", m.Data())
+		}
+	}()
+
+	// This will send to receiver "foo/bar/yep" only.
+	msg, err := NewMessage(MkPath("foo/bar/yep"), true)
+	if err != nil {
+		panic(err)
+	}
+	if err := s.Send(msg); err != nil {
+		panic(err)
+	}
+
 	wg.Wait()
 }
 

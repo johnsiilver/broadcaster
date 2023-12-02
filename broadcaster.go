@@ -11,34 +11,68 @@ It is safe for concurrent use.
 
 Example, all receivers will receive a message:
 
-	s := broadcaster.New[bool]()
-	r1 := s.Receiver(broadcaster.Path("foo/yep"), 1)
-	r2 := s.Receiver(broadcaster.Path("foo/baz/yep"), 1)
+	s := New[bool]()
+	r1, err := s.Receiver(Path("foo/yep"), 1)
+	if err != nil {
+		panic(err)
+	}
+	r2, err := s.Receiver(Path("foo/baz/yep"), 1)
+	if err != nil {
+		panic(err)
+	}
+	wg := sync.WaitGroup{}
 
+	got := [2]bool{}
+	wg.Add(1)
 	go func() {
-		for {
-			m := r1.Next(context.Background())
-			fmt.Println("r1 received: ", m.Data())
-		}
+		defer wg.Done()
+
+		m := r1.Next(context.Background())
+		fmt.Println("r1 received: ", m.Data())
+		r1.Close()
+		got[0] = m.Data()
 	}()
 
+	wg.Add(1)
 	go func() {
-		for {
-			m := r2.Next(context.Background())
-			fmt.Println("r2 received: ", m.Data())
-		}
+		defer wg.Done()
+		m := r2.Next(context.Background())
+		fmt.Println("r2 received: ", m.Data())
+		r2.Close()
+		got[1] = m.Data()
 	}()
 
 	// This will send to all receivers, as ** matches all paths recursively.
 	// ** is only valid as the last element of a path.
-	s.Send(broadcaster.NewMessage(broadcaster.Path("**"), true))
+	msg, err := NewMessage(Path("**"), true)
+	if err != nil {
+		panic(err)
+	}
+	s.Send(msg)
+
+	wg.Wait()
+
+	for i := 0; i < len(got); i++ {
+		if !got[i] {
+			log.Println("did not receive all expected messages")
+		}
+	}
 
 Example, all receivers for directory foo/bar and any direct child of foo/bar will receive the message:
 
-	s := broadcaster.New[bool]()
-	r1 := s.Receiver(broadcaster.Path("foo/bar"), 1)
-	r2 := s.Receiver(broadcaster.Path("foo/bar/yep"), 1)
-	r3 := s.Receiver(broadcaster.Path("foo/bar/qux/nope"), 1)
+	s := New[bool]()
+	r1, err := s.Receiver(Path("foo/bar"), 1)
+	if err != nil {
+		panic(err)
+	}
+	r2, err := s.Receiver(Path("foo/bar/yep"), 1)
+	if err != nil {
+		panic(err)
+	}
+	r3, err  := s.Receiver(Path("foo/bar/qux/nope"), 1)
+	if err != nil {
+		panic(err)
+	}
 
 	go func() {
 		for {
@@ -59,43 +93,65 @@ Example, all receivers for directory foo/bar and any direct child of foo/bar wil
 			m := r3.Next(context.Background())
 			fmt.Println("r3 received: ", m.Data())
 		}
-	}
+	}()
 
 	// This will send to receivers "foo/bar" and "foo/bar/yep".
 	// It will not send to "foo/bar/qux/nope" because it is not a direct child of "foo/bar".
 	// * is only valid as the last element of a path.
-	s.Send(broadcaster.NewMessage(broadcaster.Path("foo/bar/*"), true))
+	msg, err := NewMessage(Path("foo/bar/*"), true)
+	if err != nil {
+		panic(err)
+	}
+
+	if err := s.Send(msg); err != nil {
+		panic(err)
+	}
 
 Example, only the exact path will receive the message:
 
-	s := broadcaster.New[bool]()
-	r1 := s.Receiver(broadcaster.Path("foo/bar"), 1)
-	r2 := s.Receiver(broadcaster.Path("foo/bar/yep"), 1)
-	r3 := s.Receiver(broadcaster.Path("foo/bar/qux/nope"), 1)
+	s := New[bool]()
+	r1, err := s.Receiver(Path("foo/bar"), 1)
+	if err != nil {
+		panic(err)
+	}
+	r2, err := s.Receiver(Path("foo/bar/yep"), 1)
+	if err != nil {
+		panic(err)
+	}
+	r3, err := s.Receiver(Path("foo/bar/qux/nope"), 1)
+	if err != nil {
+		panic(err)
+	}
 
 	go func() {
 		for {
 			m := r1.Next(context.Background())
 			fmt.Println("r1 received: ", m.Data())
 		}
-	}
+	}()
 
 	go func() {
 		for {
 			m := r2.Next(context.Background())
 			fmt.Println("r2 received: ", m.Data())
 		}
-	}
+	}()
 
 	go func() {
 		for {
 			m := r3.Next(context.Background())
 			fmt.Println("r3 received: ", m.Data())
 		}
-	}
+	}()
 
 	// This will send to receiver "foo/bar/yep" only.
-	s.Send(broadcaster.NewMessage(broadcaster.Path("foo/bar/yep"), true))
+	msg, err := NewMessage(Path("foo/bar/yep"), true)
+	if err != nil {
+		panic(err)
+	}
+	if err := s.Send(msg); err != nil {
+		panic(err)
+	}
 */
 package broadcaster
 
@@ -104,16 +160,22 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"unicode/utf8"
 
-	"github.com/derekparker/trie"
+	"github.com/derekparker/trie/v2"
 )
 
-// Path splits a string into a path. It is a convenience function for
+// Path is a broadcast path as a slice. It roughly looks like a unix file path.
+// Create a Path using MkPath.
+type Path []string
+
+// MkPath splits a string into a path. It is a convenience function for
 // creating paths used in this package from strings. It splits on /.
-func Path(s string) []string {
+// A path starting with "/" or ending with "/" will have those trimmed.
+func MkPath(s string) Path {
 	s = strings.TrimPrefix(s, "/")
 	s = strings.TrimSuffix(s, "/")
 	return strings.Split(s, "/")
@@ -129,7 +191,7 @@ type Message[T any] struct {
 // NewMessage creates a new message for use with a Sender. See details about msgPath
 // in Sender.Receiver. data is the data that will be sent with the message where T
 // is the type of custom data the Sender will send.
-func NewMessage[T any](msgPath []string, data T) (Message[T], error) {
+func NewMessage[T any](msgPath Path, data T) (Message[T], error) {
 	for _, p := range msgPath {
 		if p == "" {
 			return Message[T]{}, fmt.Errorf("path cannot contain empty strings")
@@ -143,7 +205,7 @@ func NewMessage[T any](msgPath []string, data T) (Message[T], error) {
 	}
 
 	m := Message[T]{
-		path:         msgPath,
+		path:         []string(msgPath),
 		compiledPath: strings.Join(msgPath, "/"),
 		data:         data,
 	}
@@ -161,7 +223,9 @@ func (m Message[T]) Path() string {
 	return m.compiledPath
 }
 
-// IsZero returns true if the message is the zero value.
+// IsZero returns true if the message is the zero value. When receiving with
+// a Context that can be cancelled, this must be called to tell if the message
+// is usable.
 func (m Message[T]) IsZero() bool {
 	return reflect.ValueOf(m).IsZero()
 }
@@ -176,19 +240,16 @@ type Receiver[T any] struct {
 	receivers    *receivers[T]
 	compiledPath string
 	path         []string
-	mu           sync.RWMutex // protects q
 }
 
 // Next returns the next message. If you have a context that can be cancelled, you must
 // check Message.IsZero() to see if the message is valid.
 func (r *Receiver[T]) Next(ctx context.Context) Message[T] {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
 	select {
 	case <-ctx.Done():
 		return Message[T]{}
 	case m := <-r.q:
+		log.Println("Next: I see a returned value: ", m.compiledPath)
 		return m
 	}
 }
@@ -254,40 +315,58 @@ func (r *receivers[T]) Remove(receiver *Receiver[T]) {
 	}
 }
 
+// Empty returns true if there are no receivers here.
+func (r *receivers[T]) Empty() bool {
+	if r == nil {
+		return true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.first == nil
+}
+
 // Send sends a message to all receivers that match the path.
 func (r *receivers[T]) Send(msg Message[T]) {
 	if r == nil {
 		return
 	}
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	for receiver := r.first; receiver != nil; receiver = receiver.next {
+		log.Println("before sendToReceiver")
 		r.sendToReceiver(receiver, msg)
+		log.Println("after sendToReceiver")
 	}
 }
 
 func (r *receivers[T]) sendToReceiver(recv *Receiver[T], msg Message[T]) {
-	recv.mu.Lock()
-	defer recv.mu.Unlock()
-
+sendRecv:
 	select {
 	// We have space to add to the queue.
 	case recv.q <- msg:
+		log.Println("receiver got message")
+		return
 	// There is no space left. We need to make space.
 	default:
 		// This should yank the latest item off.
 		select {
 		case <-recv.q:
+			log.Println("we did a receiver yank")
 		default:
-			// We don't allow a queue size of 0.
-			panic("this should never happen 1")
+			// This can happen if something grabs the message from recv.q before
+			// we can remove it.
 		}
 		// This should add our new message.
 		select {
 		case recv.q <- msg:
+			log.Println("we added the message the second time")
+			return
 		default:
-			panic("this should never happen 2")
+			log.Println("looks like we are going to loop")
+			goto sendRecv
 		}
 	}
 }
@@ -302,14 +381,14 @@ func (r *receivers[T]) sendToReceiver(recv *Receiver[T], msg Message[T]) {
 // from the queue to make room.
 // It is safe for concurrent use.
 type Sender[T any] struct {
-	tree *trie.Trie
+	tree *trie.Trie[*node[T]]
 	mu   sync.RWMutex
 }
 
 // New creates a new Sender. T is the type of data that will be sent to receivers.
 func New[T any]() *Sender[T] {
 	return &Sender[T]{
-		tree: trie.New(),
+		tree: trie.New[*node[T]](),
 	}
 }
 
@@ -343,19 +422,54 @@ func (s *Sender[T]) Send(msg Message[T]) error {
 	// We have *, which means all receivers matching the path and all receivers
 	// in that directory should receive the message.
 	case dirWild:
-		p = strings.TrimSuffix(p, "/")
-		log.Println(p)
-		tnode, ok := s.tree.Find(p)
-		if !ok {
+		paths := s.tree.PrefixSearch(p)
+		if len(paths) == 0 {
 			return ErrNoMatches
 		}
+		sent := 0
 
-		n := tnode.Meta().(*node[T])
-		n.receivers.Send(msg)
+		reg := regexp.MustCompile(p + "(.*)")
+		for _, path := range paths {
+			log.Println("I see path: ", path)
+			matches := reg.FindStringSubmatch(path)
+			if len(matches) != 2 {
+				log.Println("yikes")
+				continue
+			}
+			// This means that there is another directory level underneath, which
+			// only matches on a recursive search.
+			if strings.Contains(matches[1], "/") {
+				log.Printf("skipping(%s): %s", matches[1], path)
+				continue
+			}
+			tnode, ok := s.tree.Find(path)
+			if !ok {
+				log.Println("not finding a prefix we just found: this should never happen")
+				continue
+			}
 
-		for _, child := range tnode.Children() {
-			n := child.Meta().(*node[T])
+			n := tnode.Meta()
+			if n.receivers.Empty() {
+				log.Println("skipping nil: ", path)
+				continue
+			}
+			log.Println("sending: ", n.path)
 			n.receivers.Send(msg)
+			sent++
+		}
+		// The Prefix search doesn't find the exact match for the prefix.
+		// So this looks to see if the prefix has an exact match.
+		basePath := strings.TrimSuffix(p, "/")
+		log.Println("I see path: ", basePath)
+		if tnode, ok := s.tree.Find(basePath); ok {
+			if !tnode.Meta().receivers.Empty() {
+				log.Println("sending: ", tnode.Meta().path)
+				tnode.Meta().receivers.Send(msg)
+				sent++
+			}
+		}
+		if sent == 0 {
+			return ErrNoMatches
 		}
 		return nil
 	// We have **, which means all receivers matching the path and all receivers
@@ -365,6 +479,7 @@ func (s *Sender[T]) Send(msg Message[T]) error {
 		if len(paths) == 0 {
 			return ErrNoMatches
 		}
+		sent := 0
 		for _, p := range paths {
 			tnode, ok := s.tree.Find(p)
 			if !ok {
@@ -372,8 +487,22 @@ func (s *Sender[T]) Send(msg Message[T]) error {
 				continue
 			}
 
-			n := tnode.Meta().(*node[T])
+			n := tnode.Meta()
 			n.receivers.Send(msg)
+			sent++
+		}
+
+		basePath := strings.TrimSuffix(p, "/")
+		if tnode, ok := s.tree.Find(basePath); ok {
+			if !tnode.Meta().receivers.Empty() {
+				log.Println("sending: ", tnode.Meta().path)
+				tnode.Meta().receivers.Send(msg)
+				sent++
+			}
+		}
+
+		if sent == 0 {
+			return ErrNoMatches
 		}
 		return nil
 	// We have a normal path, so we just send to receivers for that path.
@@ -383,7 +512,7 @@ func (s *Sender[T]) Send(msg Message[T]) error {
 			return ErrNoMatches
 		}
 
-		n := tnode.Meta().(*node[T])
+		n := tnode.Meta()
 		n.receivers.Send(msg)
 		return nil
 	}
@@ -400,7 +529,7 @@ func (s *Sender[T]) Send(msg Message[T]) error {
 // the message. qSize is the size of the queue. If qSize is < 1, it will be set to 1.
 // If your queue size is too small for the number of messages the receiver is able to process,
 // the oldest message will be dropped from the queue to make room, so size appropriately.
-func (s *Sender[T]) Receiver(path []string, qSize int) (*Receiver[T], error) {
+func (s *Sender[T]) Receiver(path Path, qSize int) (*Receiver[T], error) {
 	if qSize < 1 {
 		qSize = 1
 	}
@@ -423,7 +552,7 @@ func (s *Sender[T]) Receiver(path []string, qSize int) (*Receiver[T], error) {
 	}
 
 	r := &Receiver[T]{
-		path:         path,
+		path:         []string(path),
 		compiledPath: strings.Join(path, "/"),
 		q:            make(chan Message[T], qSize),
 	}
@@ -440,7 +569,7 @@ func (s *Sender[T]) Receiver(path []string, qSize int) (*Receiver[T], error) {
 		r.receivers = receivers
 		return r, nil
 	}
-	n := tnode.Meta().(*node[T])
+	n := tnode.Meta()
 	if n.receivers == nil {
 		n.receivers = &receivers[T]{}
 	}
@@ -450,7 +579,7 @@ func (s *Sender[T]) Receiver(path []string, qSize int) (*Receiver[T], error) {
 }
 
 // mustReceiver is like Receiver, but panics on error. Used in tests
-func (s *Sender[T]) mustReceiver(path []string, qSize int) *Receiver[T] {
+func (s *Sender[T]) mustReceiver(path Path, qSize int) *Receiver[T] {
 	r, err := s.Receiver(path, qSize)
 	if err != nil {
 		panic(err)
@@ -458,7 +587,7 @@ func (s *Sender[T]) mustReceiver(path []string, qSize int) *Receiver[T] {
 	return r
 }
 
-func validatePath(p []string) error {
+func validatePath(p Path) error {
 	if len(p) == 0 {
 		return fmt.Errorf("path cannot be empty")
 	}
